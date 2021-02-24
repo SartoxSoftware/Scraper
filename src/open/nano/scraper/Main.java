@@ -6,22 +6,24 @@ import open.java.toolkit.System;
 import open.java.toolkit.console.Console;
 import open.java.toolkit.console.LogType;
 import open.java.toolkit.console.ansi.Foreground;
+import open.java.toolkit.files.FileCaching;
 import open.java.toolkit.files.FileParser;
 import open.java.toolkit.files.Files;
 import open.java.toolkit.http.Request;
 import open.java.toolkit.http.RequestUtils;
+import open.java.toolkit.swing.themes.NimbusDark;
 import open.java.toolkit.threading.Parallel;
 
 import javax.swing.*;
 import java.awt.*;
-import java.io.IOException;
 import java.net.http.HttpClient;
-import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Hashtable;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static open.nano.scraper.JFrameHelper.*;
+import static open.java.toolkit.swing.SwingHelper.*;
 
 public class Main extends JFrame
 {
@@ -30,38 +32,24 @@ public class Main extends JFrame
     private final JLabel status, engine, website, keyword, size, proxy, link, retry;
     private String lastEngine = "None", lastWebsite = "None", lastKeyword = "None";
     private final ArrayList<String> scrapedLinks = new ArrayList<>();
-    private boolean error = false;
-    private final SecureRandom random = SecureRandom.getInstanceStrong();
+    private boolean interrupted = false;
     private final Util util = Util.getNewInstance();
     private FileParser settings = util.getSettings("settings/settings.txt");
+    private final Hashtable<String, String> proxyLocks = new Hashtable<>();
+    private String[] proxies, links;
 
     private int retries, timeout, threads;
-    private boolean past24Hours, showErrors, logErrors, saveLastStatus;
+    private boolean past24Hours, showErrors, logErrors, saveLastStatus, proxyLockToThread;
     private String pattern, userAgent, proxyFile, linksFile, interfaceTheme;
-    private boolean proxyLockToThread = true;
 
-    public Main() throws IOException, ClassNotFoundException, UnsupportedLookAndFeelException, InstantiationException, IllegalAccessException, NoSuchAlgorithmException
+    public Main()
     {
-        Timer titleTimer = new Timer(1000, (e ->
-        {
-            try
-            {
-                updateTitle();
-            } catch (IOException | InterruptedException ignored) {}
-        }));
+        Timer titleTimer = new Timer(1000, (e -> updateTitle()));
         titleTimer.setRepeats(true);
         titleTimer.start();
 
         if (settings.getString("interfaceTheme").equals("dark"))
-        {
-            configureDarkTheme(this);
-            for (UIManager.LookAndFeelInfo info : UIManager.getInstalledLookAndFeels())
-                if (info.getName().equals("Nimbus"))
-                {
-                    UIManager.setLookAndFeel(info.getClassName());
-                    break;
-                }
-        }
+            NimbusDark.configure(this);
 
         Dimension dimension = new Dimension(800, 600);
         setMinimumSize(dimension);
@@ -71,7 +59,7 @@ public class Main extends JFrame
         setResizable(false);
         setLayout(null);
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setTitle("Nano Scraper v1.2");
+        setTitle("Nano Scraper v1.3 - JavaToolkit v" + System.toolkitVersion);
         setDefaultLookAndFeelDecorated(true);
 
         JButton start = addButton(this, "Start", 20, 20, 110, 40);
@@ -83,7 +71,8 @@ public class Main extends JFrame
         JButton websites1 = addButton(this, "Websites", 20, 320, 110, 40);
         JButton keywords1 = addButton(this, "Keywords", 20, 370, 110, 40);
 
-        result = (JTextArea) addScrollPane(this, addTextBox(this, "", false, 150, 20, dimension.width - 160, dimension.height - 180));
+        result = alwaysUpdateCaret((JTextArea) addScrollPane(this, addTextArea(this, "", false, 150, 20, dimension.width - 160, dimension.height - 180)));
+
         status = addLabel(this, "Status : IDLE", 20, dimension.height - 70, dimension.width - 130, 20);
         engine = addLabel(this, "Engine : None", 20, dimension.height - 100, dimension.width - 130, 20);
         website = addLabel(this, "Website : None", 20, dimension.height - 130, dimension.width - 130, 20);
@@ -97,120 +86,117 @@ public class Main extends JFrame
         {
             thread = new Thread(() ->
             {
-                try
+                for (int a = 0; a < 1; a++)
                 {
                     refreshSettings();
-                } catch (IOException ignored) {}
 
-                String[] proxies = new String[0];
-                String[] links = new String[0];
+                    Console.ansiWriteLine(Foreground.GREEN, "Started!", LogType.INFO);
+                    Request.setTimeout(timeout);
+                    Request.setUserAgent(userAgent.replace("+", " "));
+                    Request.setFollowRedirects(HttpClient.Redirect.ALWAYS);
+                    Request.setVersion(HttpClient.Version.HTTP_1_1);
+                    Parallel.threads = threads;
 
-                try
-                {
-                    proxies = Files.readLines(proxyFile);
-                    links = Files.readLines(linksFile);
-                } catch (IOException ignored) {}
+                    resetStatus(true);
 
-                Console.ansiWriteLine(Foreground.GREEN, "Started!", LogType.INFO);
-                Request.setTimeout(timeout);
-                Request.setContentType("text/html; charset=utf-8");
-                Request.setUserAgent(userAgent.replace("+", " "));
-                Request.setFollowRedirects(HttpClient.Redirect.ALWAYS);
-                Request.setVersion(HttpClient.Version.HTTP_2);
-                Parallel.threads = threads;
-
-                resetStatus(true);
-
-                if (!Arrays.isEmpty(links))
-                {
-                    try
+                    if (!Arrays.isEmpty(links))
                     {
-                        scrape(links, proxies, links, random, pattern, showErrors);
-                        thread.interrupt();
-                    } catch (IOException | InterruptedException ignored) {}
-                }
-
-                String[] engines = util.getEngines();
-                String[] websites = util.getWebsites();
-                String[] keywords = util.getKeywords();
-
-                int i = 0, j = 0, k = 0;
-                if (saveLastStatus && !lastEngine.equals("None") && !lastWebsite.equals("None") && !lastKeyword.equals("None"))
-                {
-                    i = Arrays.toArrayList(engines).indexOf(lastEngine);
-                    j = Arrays.toArrayList(websites).indexOf(lastWebsite);
-                    k = Arrays.toArrayList(keywords).indexOf(lastKeyword);
-                }
-
-                scraping:
-                for (int ii = i; ii < engines.length; ii++)
-                {
-                    String engine = engines[ii];
-                    if (past24Hours && !saveLastStatus)
-                    {
-                        if (engine.contains("bing")) engine = "https://www.bing.com/search?filters=ex1%3a%22ez1%22&q=";
-                        else if (engine.contains("yahoo")) engine = "https://search.yahoo.com/search?age=1d&btf=d&q=";
-                        else if (engine.contains("yandex")) engine = "https://yandex.com/search/?within=77&text=";
-                        else if (engine.contains("google")) engine = "https://www.google.com/search?tbs=qdr:d&q=";
-                        else if (engine.contains("duckduckgo")) engine = "https://duckduckgo.com/?df=d&ia=web&q=";
-                        else if (engine.contains("aol")) engine = "https://search.aol.com/aol/search?age=1d&btf=d&q=";
+                        scrape(links);
+                        interrupted = true;
+                        break;
                     }
 
-                    lastEngine = engine;
-                    try
+                    String[] engines = util.getEngines();
+                    String[] websites = util.getWebsites();
+                    String[] keywords = util.getKeywords();
+
+                    int i = 0, j = 0, k = 0;
+                    if (saveLastStatus && !lastEngine.equals("None") && !lastWebsite.equals("None") && !lastKeyword.equals("None"))
                     {
+                        i = Arrays.toArrayList(engines).indexOf(lastEngine);
+                        j = Arrays.toArrayList(websites).indexOf(lastWebsite);
+                        k = Arrays.toArrayList(keywords).indexOf(lastKeyword);
+                    }
+                    else
+                    {
+                        lastEngine = "None";
+                        lastWebsite = "None";
+                        lastKeyword = "None";
+                    }
+
+                    for (int ii = i; ii < engines.length; ii++)
+                    {
+                        if (interrupted) break;
+
+                        String engine = engines[ii];
+                        if (past24Hours && !saveLastStatus)
+                        {
+                            if (engine.contains("bing")) engine = "https://www.bing.com/search?filters=ex1%3a%22ez1%22&q=";
+                            else if (engine.contains("yahoo")) engine = "https://search.yahoo.com/search?age=1d&btf=d&q=";
+                            else if (engine.contains("yandex")) engine = "https://yandex.com/search/?within=77&text=";
+                            else if (engine.contains("google")) engine = "https://www.google.com/search?tbs=qdr:d&q=";
+                            else if (engine.contains("duckduckgo")) engine = "https://duckduckgo.com/?df=d&ia=web&q=";
+                            else if (engine.contains("aol")) engine = "https://search.aol.com/aol/search?age=1d&btf=d&q=";
+                        }
+
+                        lastEngine = engine;
                         Files.writeString("settings/lastSettings.txt", lastEngine + "-_-_-_-_-" + lastWebsite + "-_-_-_-_-" + lastKeyword, false);
-                    } catch (IOException ignored) {}
 
-                    this.engine.setText("Engine : " + RequestUtils.urlDomainOnly(engine) + " (" + (ii + 1) + " / " + engines.length + ")");
+                        this.engine.setText("Engine : " + RequestUtils.urlDomainOnly(engine) + " (" + (ii + 1) + " / " + engines.length + ")");
 
-                    for (int jj = j; jj < websites.length; jj++)
-                    {
-                        String website = websites[jj];
+                        if (interrupted) break;
 
-                        lastWebsite = website;
-                        try
+                        for (int jj = j; jj < websites.length; jj++)
                         {
+                            if (interrupted) break;
+
+                            String website = websites[jj];
+
+                            lastWebsite = website;
                             Files.writeString("settings/lastSettings.txt", lastEngine + "-_-_-_-_-" + lastWebsite + "-_-_-_-_-" + lastKeyword, false);
-                        } catch (IOException ignored) {}
 
-                        this.website.setText("Website : " + website + " (" + (jj + 1) + " / " + websites.length + ")");
+                            this.website.setText("Website : " + website + " (" + (jj + 1) + " / " + websites.length + ")");
 
-                        for (int kk = k; kk < keywords.length; kk++)
-                        {
-                            String keyword = keywords[kk];
+                            if (interrupted) break;
 
-                            lastKeyword = keyword;
-                            try
+                            for (int kk = k; kk < keywords.length; kk++)
                             {
+                                String keyword = keywords[kk];
+
+                                lastKeyword = keyword;
                                 Files.writeString("settings/lastSettings.txt", lastEngine + "-_-_-_-_-" + lastWebsite + "-_-_-_-_-" + lastKeyword, false);
-                            } catch (IOException ignored) {}
 
-                            this.keyword.setText("Keyword : " + keyword + " (" + (kk + 1) + " / " + keywords.length + ")");
-                            this.retry.setText("Retry : 0 / " + retries);
+                                this.keyword.setText("Keyword : " + keyword + " (" + (kk + 1) + " / " + keywords.length + ")");
+                                this.retry.setText("Retry : 0 / " + retries);
 
-                            for (int r = 0; r <= retries; r++)
-                            {
-                                if (error)
+                                for (int r = 0; r <= retries; r++)
                                 {
-                                    this.retry.setText("Retry : " + r + " / " + retries);
-                                    error = false;
-                                }
+                                    if (interrupted) break;
 
-                                try
-                                {
+                                    if (System.errorOccured)
+                                    {
+                                        this.retry.setText("Retry : " + r + " / " + retries);
+                                        System.errorOccured = false;
+                                    }
+
+                                    if (interrupted) break;
+
                                     this.link.setText("Links : 0 / 0");
 
                                     if (!Arrays.isEmpty(proxies))
                                     {
-                                        String proxy = proxies[random.nextInt(proxies.length)];
+                                        String proxy = proxies[Util.random.nextInt(proxies.length)];
                                         Request.setProxy(proxy);
                                         Request.forceBuild();
                                         this.proxy.setText("Proxy : " + proxy);
                                     }
 
+                                    if (interrupted) break;
+
                                     String response = Request.sendGet(engine + "site:" + website + "+" + keyword.replace(" ", "+")).body();
                                     String[] matches = Arrays.removeDupes(Regex.getMatches(response, "https:\\/\\/" + website + "\\/\\w+")).stream().filter(link -> !scrapedLinks.contains(link)).toArray(String[]::new);
+
+                                    if (interrupted) break;
 
                                     int size = matches.length;
                                     if (size > 0)
@@ -218,7 +204,9 @@ public class Main extends JFrame
                                         Console.ansiWriteLine(Foreground.GREEN, "Got " + size + " links.", LogType.INFO);
                                         status.setText("Status : Got " + size + " links.");
 
-                                        scrape(matches, proxies, links, random, pattern, showErrors);
+                                        scrape(matches);
+
+                                        if (interrupted) break;
                                     }
                                     else
                                     {
@@ -228,31 +216,15 @@ public class Main extends JFrame
                                             status.setText("Status : Couldn't scrape any links.");
                                         }
 
-                                        error = true;
-                                    }
-                                }
-                                catch (InterruptedException ex)
-                                {
-                                    break scraping;
-                                }
-                                catch (Throwable th)
-                                {
-                                    if (showErrors)
-                                        th.printStackTrace();
-
-                                    if (logErrors)
-                                    {
-                                        try
-                                        {
-                                            Files.writeString("errors.txt", th.getMessage() + System.newLine, true);
-                                        } catch (IOException ignored) {}
+                                        if (interrupted) break;
+                                        System.errorOccured = true;
                                     }
 
-                                    error = true;
+                                    if (!System.errorOccured)
+                                        break;
                                 }
 
-                                if (!error)
-                                    break;
+                                if (interrupted) break;
                             }
                         }
                     }
@@ -260,6 +232,9 @@ public class Main extends JFrame
 
                 resetStatus(false);
                 this.retry.setText("Retry : 0 / " + retries);
+
+                if (!interrupted)
+                    Files.delete("settings/lastSettings.txt");
             });
 
             thread.start();
@@ -267,7 +242,7 @@ public class Main extends JFrame
 
         stop.addActionListener(e ->
         {
-            thread.interrupt();
+            interrupted = true;
             Console.ansiWriteLine(Foreground.GREEN, "Interrupted!", LogType.INFO);
             status.setText("Status : Interrupted!");
         });
@@ -276,7 +251,7 @@ public class Main extends JFrame
         {
             ArrayList<String> result1 = Arrays.toArrayList(result.getText().split(System.newLine));
             result1 = Arrays.removeDupes(result1);
-            result.setText(java.util.Arrays.toString(result1.toArray(new String[0])).replace(", ", System.newLine).replace("[", "").replace("]", ""));
+            result.setText(Arrays.toString(result1));
             size.setText("Size : " + result.getLineCount());
             Console.ansiWriteLine(Foreground.GREEN, "Removed duplicates!", LogType.INFO);
             status.setText("Status : Removed duplicates!");
@@ -290,11 +265,9 @@ public class Main extends JFrame
             if (chooser.showSaveDialog(this) == JFileChooser.APPROVE_OPTION)
             {
                 String path = chooser.getSelectedFile().getAbsolutePath();
+                path += (!path.endsWith(".txt") ? ".txt" : "");
 
-                try
-                {
-                    Files.writeLines(path + ".txt", result.getText().split("\\r?\\n"), false);
-                } catch (IOException ignored) {}
+                Files.writeLines(path, result.getText().split("\\r?\\n"), false);
 
                 Console.ansiWriteLine(Foreground.GREEN, "Saved result to file '" + path + "'!", LogType.INFO);
                 status.setText("Status : Saved result to file '" + path + "'!");
@@ -302,7 +275,7 @@ public class Main extends JFrame
         });
 
         JDialog dialog = new JDialog();
-        Dimension dialogDimension = new Dimension(400, 380);
+        Dimension dialogDimension = new Dimension(400, 400);
 
         dialog.setMinimumSize(dialogDimension);
         dialog.setMaximumSize(dialogDimension);
@@ -317,66 +290,78 @@ public class Main extends JFrame
 
         addLabel(dialog, "Pattern :", 20, 20, dialogDimension.width - 130, 20);
         JTextField pattern = addTextBox(dialog, this.pattern, true, 150, 20, dialogDimension.width - 170, 20);
+
         addLabel(dialog, "Retries :", 20, 40, dialogDimension.width - 130, 20);
         JTextField retries = addTextBox(dialog, String.valueOf(this.retries), true, 150, 40, dialogDimension.width - 170, 20);
+
         addLabel(dialog, "Timeout :", 20, 60, dialogDimension.width - 130, 20);
         JTextField timeout = addTextBox(dialog, String.valueOf(this.timeout), true, 150, 60, dialogDimension.width - 170, 20);
+
         addLabel(dialog, "Threads :", 20, 80, dialogDimension.width - 130, 20);
         JTextField threads = addTextBox(dialog, String.valueOf(this.threads), true, 150, 80, dialogDimension.width - 170, 20);
-        addLabel(dialog, "Past 24 hours :", 20, 100, dialogDimension.width - 130, 20);
-        JComboBox<Boolean> past24Hours = addComboBox(dialog, this.past24Hours, 150, 100, dialogDimension.width - 170, 20);
-        addLabel(dialog, "Show errors :", 20, 120, dialogDimension.width - 130, 20);
-        JComboBox<Boolean> showErrors = addComboBox(dialog, this.showErrors, 150, 120, dialogDimension.width - 170, 20);
-        addLabel(dialog, "Log errors :", 20, 140, dialogDimension.width - 130, 20);
-        JComboBox<Boolean> logErrors = addComboBox(dialog, this.logErrors, 150, 140, dialogDimension.width - 170, 20);
-        addLabel(dialog, "Save last status :", 20, 160, dialogDimension.width - 130, 20);
-        JComboBox<Boolean> saveLastStatus = addComboBox(dialog, this.saveLastStatus, 150, 160, dialogDimension.width - 170, 20);
-        addLabel(dialog, "Interface theme :", 20, 180, dialogDimension.width - 130, 20);
-        JComboBox<String> interfaceTheme = addThemeComboBox(dialog, this.interfaceTheme, 150, 180, dialogDimension.width - 170, 20);
-        addLabel(dialog, "Proxy file :", 20, 200, dialogDimension.width - 130, 20);
-        JTextField proxyFile = addTextBox(dialog, this.proxyFile, true, 150, 200, dialogDimension.width - 170, 20);
-        addLabel(dialog, "Links file :", 20, 220, dialogDimension.width - 130, 20);
-        JTextField linksFile = addTextBox(dialog, this.linksFile, true, 150, 220, dialogDimension.width - 170, 20);
-        addLabel(dialog, "User Agent :", 20, 240, dialogDimension.width - 130, 20);
-        JTextField userAgent = addTextBox(dialog, this.userAgent.replace("+", " "), true, 150, 240, dialogDimension.width - 170, 20);
 
-        JButton save2 = addButton(dialog, "Save", dialogDimension.width / 3 + 15, 280, 100, 40);
+        addLabel(dialog, "Past 24 hours :", 20, 100, dialogDimension.width - 130, 20);
+        JComboBox<Boolean> past24Hours = addSettingsComboBox(dialog, this.past24Hours, 150, 100, dialogDimension.width - 170, 20);
+
+        addLabel(dialog, "Show errors :", 20, 120, dialogDimension.width - 130, 20);
+        JComboBox<Boolean> showErrors = addSettingsComboBox(dialog, this.showErrors, 150, 120, dialogDimension.width - 170, 20);
+
+        addLabel(dialog, "Log errors :", 20, 140, dialogDimension.width - 130, 20);
+        JComboBox<Boolean> logErrors = addSettingsComboBox(dialog, this.logErrors, 150, 140, dialogDimension.width - 170, 20);
+
+        addLabel(dialog, "Save last status :", 20, 160, dialogDimension.width - 130, 20);
+        JComboBox<Boolean> saveLastStatus = addSettingsComboBox(dialog, this.saveLastStatus, 150, 160, dialogDimension.width - 170, 20);
+
+        addLabel(dialog, "Lock proxies :", 20, 180, dialogDimension.width - 130, 20);
+        JComboBox<Boolean> proxyLockToThread = addSettingsComboBox(dialog, this.proxyLockToThread, 150, 180, dialogDimension.width - 170, 20);
+
+        addLabel(dialog, "Interface theme :", 20, 200, dialogDimension.width - 130, 20);
+        JComboBox<String> interfaceTheme = addThemeComboBox(dialog, this.interfaceTheme, 150, 200, dialogDimension.width - 170, 20);
+
+        addLabel(dialog, "Proxy file :", 20, 220, dialogDimension.width - 130, 20);
+        JTextField proxyFile = addTextBox(dialog, this.proxyFile, true, 150, 220, dialogDimension.width - 170, 20);
+
+        addLabel(dialog, "Links file :", 20, 240, dialogDimension.width - 130, 20);
+        JTextField linksFile = addTextBox(dialog, this.linksFile, true, 150, 240, dialogDimension.width - 170, 20);
+
+        addLabel(dialog, "User Agent :", 20, 260, dialogDimension.width - 130, 20);
+        JTextField userAgent = addTextBox(dialog, this.userAgent.replace("+", " "), true, 150, 260, dialogDimension.width - 170, 20);
+
+        JButton save2 = addButton(dialog, "Save", dialogDimension.width / 3 + 15, 300, 100, 40);
         save2.addActionListener(e2 ->
         {
-            try
-            {
-                this.settings.setString("pattern", pattern.getText());
-                this.settings.setInt("retries", Integer.parseInt(retries.getText()));
-                this.settings.setInt("timeout", Integer.parseInt(timeout.getText()));
-                this.settings.setString("past24Hours", String.valueOf(past24Hours.getSelectedItem()));
-                this.settings.setString("showErrors", String.valueOf(showErrors.getSelectedItem()));
-                this.settings.setString("logErrors", String.valueOf(logErrors.getSelectedItem()));
-                this.settings.setString("proxyFile", proxyFile.getText());
-                this.settings.setString("linksFile", linksFile.getText());
-                this.settings.setString("saveLastStatus", String.valueOf(saveLastStatus.getSelectedItem()));
-                this.settings.setString("interfaceTheme", String.valueOf(interfaceTheme.getSelectedItem()));
-                this.settings.setInt("threads", Integer.parseInt(threads.getText()));
-                this.settings.setString("userAgent", userAgent.getText().replace(" ", "+"));
+            this.settings.setString("pattern", pattern.getText());
+            this.settings.setInt("retries", Integer.parseInt(retries.getText()));
+            this.settings.setInt("timeout", Integer.parseInt(timeout.getText()));
+            this.settings.setString("past24Hours", String.valueOf(past24Hours.getSelectedItem()));
+            this.settings.setString("showErrors", String.valueOf(showErrors.getSelectedItem()));
+            this.settings.setString("logErrors", String.valueOf(logErrors.getSelectedItem()));
+            this.settings.setString("proxyFile", proxyFile.getText());
+            this.settings.setString("linksFile", linksFile.getText());
+            this.settings.setString("saveLastStatus", String.valueOf(saveLastStatus.getSelectedItem()));
+            this.settings.setString("proxyLockToThread", String.valueOf(proxyLockToThread.getSelectedItem()));
+            this.settings.setString("interfaceTheme", String.valueOf(interfaceTheme.getSelectedItem()));
+            this.settings.setInt("threads", Integer.parseInt(threads.getText()));
+            this.settings.setString("userAgent", userAgent.getText().replace(" ", "+"));
 
-                Console.ansiWriteLine(Foreground.GREEN, "Saved settings!", LogType.INFO);
-            } catch (IOException ignored) {}
+            Console.ansiWriteLine(Foreground.GREEN, "Saved settings!", LogType.INFO);
         });
 
         settings.addActionListener(e -> dialog.setVisible(true));
 
-        JDialog jEngines = createNewDialog(dialogDimension, "Engines");
+        JDialog jEngines = JFrameHelper.createNewDialog(dialogDimension, "Engines");
         engines1.addActionListener(e -> jEngines.setVisible(true));
 
-        JDialog jWebsites = createNewDialog(dialogDimension, "Websites");
+        JDialog jWebsites = JFrameHelper.createNewDialog(dialogDimension, "Websites");
         websites1.addActionListener(e -> jWebsites.setVisible(true));
 
-        JDialog jKeywords = createNewDialog(dialogDimension, "Keywords");
+        JDialog jKeywords = JFrameHelper.createNewDialog(dialogDimension, "Keywords");
         keywords1.addActionListener(e -> jKeywords.setVisible(true));
 
         setVisible(true);
     }
 
-    private void scrape(String[] matches, String[] proxies, String[] links, SecureRandom random, String pattern, boolean showErrors) throws IOException, InterruptedException
+    private void scrape(String[] matches)
     {
         AtomicInteger link1 = new AtomicInteger();
         int links1 = matches.length;
@@ -384,127 +369,188 @@ public class Main extends JFrame
 
         Parallel.forEach(matches, link ->
         {
-            if (!Arrays.isEmpty(proxies) && !Arrays.isEmpty(links))
+            for (int i = 0; i < 1; i++)
             {
-                String proxy = proxies[random.nextInt(proxies.length)];
-                Request.setProxy(proxy);
-                Request.forceBuild();
-                this.proxy.setText("Proxy : " + proxy);
-            }
+                if (interrupted) break;
 
-            String linkResponse = Request.sendGet(link).body().replace("|", ":");
-
-            if (!linkResponse.contains(":"))
-                linkResponse = linkResponse.replace(" ", ":");
-
-            if (link.contains("anonfiles.com"))
-            {
-                ArrayList<String> linkMatches = Regex.getMatches(linkResponse, "https:\\/\\/.*.anonfiles.com\\/.*");
-                if (linkMatches.size() > 0)
+                if (!Arrays.isEmpty(proxies) && !Arrays.isEmpty(links))
                 {
-                    String[] result = linkMatches.toString().replace(", ", System.newLine).replace("[", "").replace("]", "").split(System.newLine);
-                    for (String str : result)
+                    String proxy = proxies[Util.random.nextInt(proxies.length)];
+                    boolean valid = false;
+
+                    if (interrupted) break;
+
+                    if (proxyLockToThread)
                     {
-                        String body = Request.sendGet(str.replace(">                    <img", "").replace("\"", "").replace(" ", "+")).body();
-                        int size = body.split(System.newLine).length;
-                        Console.ansiWriteLine(Foreground.GREEN, "Scraped " + size + " result", LogType.INFO);
-                        status.setText("Status : Scraped " + size + " result");
+                        if (!proxyLocks.containsKey(Thread.currentThread().getName()))
+                            proxyLocks.put(Thread.currentThread().getName(), proxy);
 
-                        if (size > 33000)
+                        if (proxyLocks.get(Thread.currentThread().getName()).equals(proxy))
+                            valid = true;
+                    } else valid = true;
+
+                    if (interrupted) break;
+
+                    if (valid)
+                    {
+                        Request.setProxy(proxy);
+                        Request.forceBuild();
+                        this.proxy.setText("Proxy : " + proxy);
+                    }
+                }
+
+                if (interrupted) break;
+
+                String linkResponse = Request.sendGet(link)
+                        .body()
+                        .replace("\\n", "\n")
+                        .replace("|", ":")
+                        .replace("; ", ":")
+                        .replace("   ", ":")
+                        .replace(" ", ":");
+
+                if (interrupted) break;
+
+                if (link.contains("anonfiles.com") || link.contains("anonfile.com"))
+                {
+                    ArrayList<String> linkMatches = Regex.getMatches(linkResponse, "https:\\/\\/.*." + link + "\\/.*");
+                    if (linkMatches.size() > 0)
+                    {
+                        if (interrupted) break;
+
+                        String[] result = Arrays.toString(linkMatches).split(System.newLine);
+                        for (String str : result)
                         {
-                            int substringSize = size / 3;
+                            if (interrupted) break;
 
-                            int totalSubstrings = (int) Math.ceil((double)body.length() / substringSize);
-                            String[] strSubstrings = new String[totalSubstrings];
+                            String body = Request.sendGet(str.replace(">                    <img", "").replace("\"", "").replace(" ", "+")).body();
+                            ArrayList<String> anonMatches = Regex.getMatches(body, pattern);
 
-                            int index = 0;
-                            for(int i = 0; i < body.length(); i = i + substringSize)
-                                strSubstrings[index++] = body.substring(i, Math.min(i + substringSize, body.length()));
+                            if (interrupted) break;
 
-                            for (String part : strSubstrings)
-                                this.result.append(part + System.newLine);
-                        } else this.result.append(body + System.newLine);
+                            if (anonMatches.size() > 0)
+                            {
+                                Console.ansiWriteLine(Foreground.GREEN, "Scraped " + anonMatches.size() + " result.", LogType.INFO);
+                                status.setText("Status : Scraped " + anonMatches.size() + " result.");
+
+                                if (interrupted) break;
+
+                                this.result.append(Arrays.toString(anonMatches) + System.newLine);
+
+                                if (interrupted) break;
+
+                                scrapedLinks.add(link);
+                                this.size.setText("Size : " + this.result.getLineCount());
+                            }
+                            else
+                            {
+                                if (showErrors)
+                                {
+                                    Console.ansiWriteLine(Foreground.RED, "Couldn't scrape any result.", LogType.ERROR);
+                                    status.setText("Status : Couldn't scrape any result.");
+                                }
+                            }
+
+                            if (interrupted) break;
+                        }
+
+                        if (interrupted) break;
+                    }
+                    else
+                    {
+                        if (interrupted) break;
+
+                        if (showErrors)
+                        {
+                            Console.ansiWriteLine(Foreground.RED, "Couldn't scrape any links.", LogType.ERROR);
+                            status.setText("Status : Couldn't scrape any links.");
+                        }
+                    }
+                }
+                else
+                {
+                    ArrayList<String> linkMatches = Regex.getMatches(linkResponse, pattern);
+                    int linkSize = linkMatches.size();
+
+                    if (interrupted) break;
+
+                    if (linkSize > 0)
+                    {
+                        Console.ansiWriteLine(Foreground.GREEN, "Scraped " + linkSize + " result.", LogType.INFO);
+                        status.setText("Status : Scraped " + linkSize + " result.");
+
+                        if (interrupted) break;
+
+                        result.append(Arrays.toString(linkMatches) + System.newLine);
+
+                        if (interrupted) break;
 
                         scrapedLinks.add(link);
-                        this.size.setText("Size : " + this.result.getLineCount());
+                        this.size.setText("Size : " + result.getLineCount());
                     }
-                }
-                else
-                {
-                    if (showErrors)
+                    else
                     {
-                        Console.ansiWriteLine(Foreground.RED, "Couldn't scrape any result", LogType.ERROR);
-                        status.setText("Status : Couldn't scrape any result");
+                        if (showErrors)
+                        {
+                            Console.ansiWriteLine(Foreground.RED, "Couldn't scrape any result.", LogType.ERROR);
+                            status.setText("Status : Couldn't scrape any result.");
+                        }
                     }
+
+                    if (interrupted) break;
                 }
+
+                if (interrupted) break;
+
+                link1.getAndIncrement();
+                this.link.setText("Links : " + link1 + " / " + links1);
             }
-            else
-            {
-                ArrayList<String> linkMatches = Regex.getMatches(linkResponse, pattern);
-                int linkSize = linkMatches.size();
-
-                if (linkSize > 0)
-                {
-                    Console.ansiWriteLine(Foreground.GREEN, "Scraped " + linkSize + " result", LogType.INFO);
-                    status.setText("Status : Scraped " + linkSize + " result");
-
-                    if (linkSize > 33000)
-                    {
-                        int substringSize = linkSize / 3;
-
-                        int totalSubstrings = (int) Math.ceil((double)linkMatches.size() / substringSize);
-                        String[] strSubstrings = new String[totalSubstrings];
-
-                        int index = 0;
-                        for(int i = 0; i < linkMatches.size(); i = i + substringSize)
-                            strSubstrings[index++] = linkMatches.subList(i, Math.min(i + substringSize, linkMatches.size())).toString().replace(", ", System.newLine).replace("[", "").replace("]", "");
-
-                        for (String part : strSubstrings)
-                            result.append(part + System.newLine);
-                    } else result.append(linkMatches.toString().replace(", ", System.newLine).replace("[", "").replace("]", "") + System.newLine);
-
-                    scrapedLinks.add(link);
-                    this.size.setText("Size : " + result.getLineCount());
-                }
-                else
-                {
-                    if (showErrors)
-                    {
-                        Console.ansiWriteLine(Foreground.RED, "Couldn't scrape any result", LogType.ERROR);
-                        status.setText("Status : Couldn't scrape any result");
-                    }
-                }
-            }
-
-            link1.getAndIncrement();
-            this.link.setText("Links : " + link1 + " / " + links1);
         });
     }
 
-    private void refreshSettings() throws IOException
+    private void refreshSettings()
     {
-        this.settings = util.getSettings("settings/settings.txt");
+        util.refreshFiles();
+        interrupted = false;
 
-        retries = this.settings.getInt("retries");
-        timeout = this.settings.getInt("timeout");
-        threads = this.settings.getInt("threads");
-        past24Hours = this.settings.getBoolean("past24Hours");
-        showErrors = this.settings.getBoolean("showErrors");
-        logErrors = this.settings.getBoolean("logErrors");
-        saveLastStatus = this.settings.getBoolean("saveLastStatus");
-        pattern = this.settings.getString("pattern");
-        userAgent = this.settings.getString("userAgent");
-        proxyFile = this.settings.getString("proxyFile");
-        linksFile = this.settings.getString("linksFile");
-        interfaceTheme = this.settings.getString("interfaceTheme");
+        settings = util.getSettings("settings/settings.txt");
 
-        String[] lastSettings = Files.readFile("settings/lastSettings.txt").split(System.newLine)[0].split("-_-_-_-_-");
-        lastEngine = lastSettings[0];
-        lastWebsite = lastSettings[1];
-        lastKeyword = lastSettings[2];
+        retries = settings.getInt("retries");
+        timeout = settings.getInt("timeout");
+        threads = settings.getInt("threads");
+        past24Hours = settings.getBoolean("past24Hours");
+        showErrors = settings.getBoolean("showErrors");
+        logErrors = settings.getBoolean("logErrors");
+        saveLastStatus = settings.getBoolean("saveLastStatus");
+        pattern = settings.getString("pattern");
+        userAgent = settings.getString("userAgent");
+        proxyFile = settings.getString("proxyFile");
+        linksFile = settings.getString("linksFile");
+        interfaceTheme = settings.getString("interfaceTheme");
+        proxyLockToThread = settings.getBoolean("proxyLockToThread");
+
+        System.showErrors = showErrors;
+        System.logErrors = logErrors;
+
+        if (Files.fileExists(proxyFile))
+        {
+            FileCaching.cache(proxyFile);
+            proxies = new String(FileCaching.get(proxyFile), StandardCharsets.UTF_8).split(System.newLine);
+        }
+
+        if (Files.fileExists(linksFile))
+        {
+            FileCaching.cache(linksFile);
+            links = new String(FileCaching.get(linksFile), StandardCharsets.UTF_8).split(System.newLine);
+        }
+
+        String[] lastSettings = Files.fileExists("settings/lastSettings.txt") ? Files.readFile("settings/lastSettings.txt").split("-_-_-_-_-") : new String[] { "None", "None", "None" };
+        lastEngine = lastSettings[0].equals("None") ? util.getEngines()[0] : lastSettings[0];
+        lastWebsite = lastSettings[1].equals("None") ? util.getWebsites()[0] : lastSettings[1];
+        lastKeyword = lastSettings[2].equals("None") ? util.getKeywords()[0] : lastSettings[2];
     }
 
-    private void updateTitle() throws IOException, InterruptedException
+    private void updateTitle()
     {
         long total = Runtime.getRuntime().totalMemory();
         long free = Runtime.getRuntime().freeMemory();
@@ -528,13 +574,19 @@ public class Main extends JFrame
             if (!saveLastStatus)
             {
                 scrapedLinks.clear();
+                proxyLocks.clear();
                 result.setText("");
                 size.setText("Size : 0");
             }
-        } else scrapedLinks.clear();
+        }
+        else
+        {
+            scrapedLinks.clear();
+            proxyLocks.clear();
+        }
     }
 
-    public static void main(String[] args) throws IOException, ClassNotFoundException, UnsupportedLookAndFeelException, InstantiationException, IllegalAccessException, NoSuchAlgorithmException
+    public static void main(String[] args)
     {
         new Main();
     }

@@ -3,18 +3,37 @@ package open.nano.scraper;
 import open.java.toolkit.files.FileParser;
 import open.java.toolkit.files.Files;
 
-import java.io.IOException;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 
 public class Util
 {
     private String[] engines, websites, keywords;
+    public static SecureRandom random;
 
-    public static Util getNewInstance() throws IOException
+    static
+    {
+        try
+        {
+            random = SecureRandom.getInstanceStrong();
+        }
+        catch (NoSuchAlgorithmException e)
+        {
+            e.printStackTrace();
+        }
+    }
+
+    public static Util getNewInstance()
     {
         return new Util();
     }
 
-    public Util() throws IOException
+    public Util()
+    {
+        refreshFiles();
+    }
+
+    public void refreshFiles()
     {
         engines = Files.readLines("settings/engines.txt");
         websites = Files.readLines("settings/websites.txt");
@@ -36,8 +55,8 @@ public class Util
         return keywords;
     }
 
-    public FileParser getSettings(String path) throws IOException
+    public FileParser getSettings(String path)
     {
-        return new FileParser(path, "#", "=", true, 1);
+        return new FileParser(path, "#", "%", true, 1);
     }
 }
